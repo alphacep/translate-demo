@@ -7,6 +7,7 @@ import os
 import concurrent.futures
 import asyncio
 
+from timeit import default_timer as timer
 from pathlib import Path
 from aiohttp import web
 from aiohttp.web_exceptions import HTTPServiceUnavailable
@@ -44,14 +45,14 @@ recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(
             rule1_min_trailing_silence=2.0,
             rule2_min_trailing_silence=1.0,
             rule3_min_utterance_length=300,  # it essentially disables this rule
-            provider="cpu",
+            provider="cuda",
             model_type="zipformer2")
 
 
 llama_model = Llama(
         model_path = "llama-model/gemma-3-4b-it-Q8_0.gguf",
         n_ctx = 4096,
-        n_parts = 1,
+        n_gpu_layers = 100,
         verbose = False,
     )
 SYSTEM_PROMPT = "Ты переводчик с русского на английский. Переводи дословно всё, что я говорю."
@@ -62,7 +63,7 @@ tts_config = sherpa_onnx.OfflineTtsConfig(
             model = "kokoro-model/model.onnx",
             voices = "kokoro-model/voices.bin",
             tokens = "kokoro-model/tokens.txt",
-            data_dir = "kokoro-model/espeak-ng-data")))
+            data_dir = "kokoro-model/espeak-ng-data"), num_threads=4, provider="cuda"))
 tts_model = sherpa_onnx.OfflineTts(tts_config)
 
 pool = concurrent.futures.ThreadPoolExecutor((os.cpu_count() or 1))
@@ -80,6 +81,9 @@ def process_chunk(stream, messages, message):
         recognizer.reset(stream)
 
         if result != "":
+
+            start_llm = timer()
+
             messages.append({"role": "user", "content": result})
             response = llama_model.create_chat_completion(
                 messages,
@@ -89,11 +93,15 @@ def process_chunk(stream, messages, message):
                 repeat_penalty=1.1,
             )
             response = response["choices"][0]["message"]["content"].replace("\"", "")
-            print ("Translatiton", response)
+            print (f"Translatiton {response}", flush=True)
+            end_llm = timer()
             messages.append({"role": "assistant", "content": response})
 
             audio = tts_model.generate(response, sid=0, speed=1.0)
             sf.write("test-en.wav", audio.samples, audio.sample_rate, subtype="PCM_16")
+            end_tts = timer()
+
+            print (f"LLM {end_llm - start_llm:.3f} TTS {end_tts - end_llm:.3f}", flush=True)
 
             return f"{{ \"text\": \"{result}\", \"translation\": \"{response}\" }}", True
         else:
@@ -153,7 +161,7 @@ class VoskTask:
                 dump_fd.write(bytes(dataframes))
 
             result, final = await loop.run_in_executor(pool, process_chunk, self.__stream, self.__messages, bytes(dataframes))
-            print(result)
+            print(result, flush=True)
             if final:
                 self.__playback_track.select("test-en.wav")
             self.__channel.send(result)
