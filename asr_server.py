@@ -69,6 +69,9 @@ tts_model = sherpa_onnx.OfflineTts(tts_config)
 pool = concurrent.futures.ThreadPoolExecutor((os.cpu_count() or 1))
 dump_fd = None if vosk_dump_file is None else open(vosk_dump_file, "wb")
 
+students = []
+
+
 def process_chunk(stream, messages, message):
     samples_int16 = np.frombuffer(message, dtype=np.int16).astype(np.float32) / 32768.0
     stream.accept_waveform(16000, samples_int16)
@@ -116,13 +119,9 @@ class VoskTask:
         self.__pc = user_connection
         self.__audio_task = None
         self.__track = None
-        self.__playback_track = None
         self.__channel = None
         self.__stream = recognizer.create_stream()
         self.__messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-
-    async def set_playback_track(self, track):
-        self.__playback_track = track
 
     async def set_audio_track(self, track):
         self.__track = track
@@ -162,16 +161,42 @@ class VoskTask:
 
             result, final = await loop.run_in_executor(pool, process_chunk, self.__stream, self.__messages, bytes(dataframes))
             print(result, flush=True)
+
             if final:
-                self.__playback_track.select("test-en.wav")
+                for student in students:
+                    await student.send_result(result)
+
             self.__channel.send(result)
 
-async def index(request):
-    content = open(str(ROOT / 'static' / 'index.html')).read()
+
+class StudentTask:
+    def __init__(self, user_connection):
+        self.__pc = user_connection
+        self.__playback_track = None
+        self.__track = None
+        self.__channel = None
+
+    async def set_text_channel(self, channel):
+        self.__channel = channel
+
+    async def set_playback_track(self, track):
+        self.__playback_track = track
+
+    async def send_result(self, result):
+        self.__playback_track.select("test-en.wav")
+        self.__channel.send(result)
+
+
+async def index_lecture(request):
+    content = open(str(ROOT / 'static' / 'lecture' / 'index.html')).read()
+    return web.Response(content_type='text/html', text=content)
+
+async def index_student(request):
+    content = open(str(ROOT / 'static' / 'student' / 'index.html')).read()
     return web.Response(content_type='text/html', text=content)
 
 
-async def offer(request):
+async def offer_lecture(request):
 
     params = await request.json()
     offer = RTCSessionDescription(
@@ -181,9 +206,6 @@ async def offer(request):
     pc = RTCPeerConnection(RTCConfiguration(portRange=vosk_udp_port_range))
 
     vosk = VoskTask(pc)
-    playback_track = PlaybackTrack()
-    pc.addTrack(playback_track)
-    await vosk.set_playback_track(playback_track)
 
     @pc.on('datachannel')
     async def on_datachannel(channel):
@@ -217,6 +239,56 @@ async def offer(request):
         }))
 
 
+
+
+async def offer_student(request):
+
+    params = await request.json()
+    offer = RTCSessionDescription(
+        sdp=params['sdp'],
+        type=params['type'])
+
+    pc = RTCPeerConnection(RTCConfiguration(portRange=vosk_udp_port_range))
+
+    student = StudentTask(pc)
+    playback_track = PlaybackTrack()
+    pc.addTrack(playback_track)
+    await student.set_playback_track(playback_track)
+
+    @pc.on('datachannel')
+    async def on_datachannel(channel):
+        channel.send('{}') # Dummy message to make the UI change to "Listening"
+        await student.set_text_channel(channel)
+
+    @pc.on('iceconnectionstatechange')
+    async def on_iceconnectionstatechange():
+        if pc.iceConnectionState == 'failed':
+            await pc.close()
+
+    @pc.on('track')
+    async def on_track(track):
+        if track.kind == 'audio':
+            await student.set_audio_track(track)
+
+        @track.on('ended')
+        async def on_ended():
+            students.remove(student)
+            await student.stop()
+
+    await pc.setRemoteDescription(offer)
+    answer = await pc.createAnswer()
+    await pc.setLocalDescription(answer)
+
+    students.append(student)
+
+    return web.Response(
+        content_type='application/json',
+        text=json.dumps({
+            'sdp': pc.localDescription.sdp,
+            'type': pc.localDescription.type
+        }))
+
+
 if __name__ == '__main__':
 
     if vosk_cert_file:
@@ -226,9 +298,11 @@ if __name__ == '__main__':
         ssl_context = None
 
     app = web.Application()
-    app.router.add_post('/offer', offer)
+    app.router.add_post('/lecture/offer_lecture', offer_lecture)
+    app.router.add_post('/student/offer_student', offer_student)
 
-    app.router.add_get('/', index)
+    app.router.add_get('/lecture/', index_lecture)
+    app.router.add_get('/student/', index_student)
     app.router.add_static('/static/', path=ROOT / 'static', name='static')
 
     web.run_app(app, port=vosk_port, ssl_context=ssl_context)

@@ -38,7 +38,7 @@ function negotiate() {
     }).then(function () {
         var offer = pc.localDescription;
         console.log(offer.sdp);
-        return fetch('offer', {
+        return fetch('offer_student', {
             body: JSON.stringify({
                 sdp: offer.sdp,
                 type: offer.type,
@@ -90,7 +90,7 @@ function start() {
         console.log('Opened data channel');
     };
     dc.onmessage = function (messageEvent) {
-        statusField.innerText = "Listening... say something";
+        statusField.innerText = "Wait for teacher to start speaking";
 
         if (!messageEvent.data) {
             return;
