@@ -95,7 +95,7 @@ def process_chunk(stream, messages, message):
                 top_p=0.95,
                 repeat_penalty=1.1,
             )
-            response = response["choices"][0]["message"]["content"].replace("\"", "")
+            response = response["choices"][0]["message"]["content"].replace("\"", "").replace("\n", " ")
             print (f"Translatiton {response}", flush=True)
             end_llm = timer()
             messages.append({"role": "assistant", "content": response})
@@ -175,6 +175,9 @@ class StudentTask:
         self.__playback_track = None
         self.__track = None
         self.__channel = None
+
+    async def set_audio_track(self, track):
+        self.__track = track
 
     async def set_text_channel(self, channel):
         self.__channel = channel
