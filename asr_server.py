@@ -29,7 +29,7 @@ vosk_model_path = os.environ.get('VOSK_MODEL_PATH', 'model')
 vosk_cert_file = os.environ.get('VOSK_CERT_FILE', None)
 vosk_key_file = os.environ.get('VOSK_KEY_FILE', None)
 vosk_dump_file = os.environ.get('VOSK_DUMP_FILE', None)
-vosk_udp_port_range = os.environ.get('VOSK_UDP_PORT_RANGE', '35000:35100')
+vosk_udp_port_range = os.environ.get('VOSK_UDP_PORT_RANGE', '35000:36000')
 
 recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(
             encoder="asr-model/am-onnx/encoder.onnx",
@@ -69,7 +69,7 @@ tts_model = sherpa_onnx.OfflineTts(tts_config)
 pool = concurrent.futures.ThreadPoolExecutor((os.cpu_count() or 1))
 dump_fd = None if vosk_dump_file is None else open(vosk_dump_file, "wb")
 
-students = []
+students = set()
 
 
 def process_chunk(stream, messages, message):
@@ -113,7 +113,7 @@ def process_chunk(stream, messages, message):
         return f"{{ \"partial\": \"{result}\" }}", False
 
 
-class VoskTask:
+class RecognizerTask:
     def __init__(self, user_connection):
         self.__resampler = AudioResampler(format='s16', layout='mono', rate=16000)
         self.__pc = user_connection
@@ -173,11 +173,7 @@ class StudentTask:
     def __init__(self, user_connection):
         self.__pc = user_connection
         self.__playback_track = None
-        self.__track = None
         self.__channel = None
-
-    async def set_audio_track(self, track):
-        self.__track = track
 
     async def set_text_channel(self, channel):
         self.__channel = channel
@@ -186,8 +182,14 @@ class StudentTask:
         self.__playback_track = track
 
     async def send_result(self, result):
-        self.__playback_track.select("test-en.wav")
-        self.__channel.send(result)
+        if self.__playback_track is not None:
+            self.__playback_track.select("test-en.wav")
+        if self.__channel is not None:
+            self.__channel.send(result)
+
+    def stop(self):
+        if self.__playback_track is not None:
+            self.__playback_track.stop()
 
 
 async def index_lecture(request):
@@ -208,27 +210,37 @@ async def offer_lecture(request):
 
     pc = RTCPeerConnection(RTCConfiguration(portRange=vosk_udp_port_range))
 
-    vosk = VoskTask(pc)
+    recognizer_task = RecognizerTask(pc)
 
     @pc.on('datachannel')
     async def on_datachannel(channel):
+        print("Lecture data channel")
         channel.send('{}') # Dummy message to make the UI change to "Listening"
-        await vosk.set_text_channel(channel)
-        await vosk.start()
+        await recognizer_task.set_text_channel(channel)
+        await recognizer_task.start()
+
+    @pc.on('connectionstatechange')
+    async def on_connectionstatechange():
+        print("Lecture connection state is %s" % pc.connectionState)
+        if pc.connectionState == 'failed' or pc.connectionState == 'closed':
+            await recognizer_task.stop()
+            await pc.close()
 
     @pc.on('iceconnectionstatechange')
     async def on_iceconnectionstatechange():
+        print("Lecture ICE connection state is %s" % pc.iceConnectionState)
         if pc.iceConnectionState == 'failed':
+            await recognizer_task.stop()
             await pc.close()
 
     @pc.on('track')
     async def on_track(track):
         if track.kind == 'audio':
-            await vosk.set_audio_track(track)
+            await recognizer_task.set_audio_track(track)
 
         @track.on('ended')
         async def on_ended():
-            await vosk.stop()
+            await recognizer_task.stop()
 
     await pc.setRemoteDescription(offer)
     answer = await pc.createAnswer()
@@ -252,7 +264,6 @@ async def offer_student(request):
         type=params['type'])
 
     pc = RTCPeerConnection(RTCConfiguration(portRange=vosk_udp_port_range))
-
     student = StudentTask(pc)
     playback_track = PlaybackTrack()
     pc.addTrack(playback_track)
@@ -260,29 +271,29 @@ async def offer_student(request):
 
     @pc.on('datachannel')
     async def on_datachannel(channel):
+        print("Student data channel")
         channel.send('{}') # Dummy message to make the UI change to "Listening"
         await student.set_text_channel(channel)
 
     @pc.on('iceconnectionstatechange')
     async def on_iceconnectionstatechange():
+        print("Student ICE connection state is %s" % pc.iceConnectionState)
         if pc.iceConnectionState == 'failed':
             await pc.close()
 
-    @pc.on('track')
-    async def on_track(track):
-        if track.kind == 'audio':
-            await student.set_audio_track(track)
-
-        @track.on('ended')
-        async def on_ended():
-            students.remove(student)
-            await student.stop()
+    @pc.on('connectionstatechange')
+    async def on_connectionstatechange():
+        print("Student connection state is %s" % pc.connectionState)
+        if pc.connectionState == 'connected':
+            students.add(student)
+        elif pc.connectionState == 'failed' or pc.connectionState == 'closed':
+            students.discard(student)
+            student.stop()
+            await pc.close()
 
     await pc.setRemoteDescription(offer)
     answer = await pc.createAnswer()
     await pc.setLocalDescription(answer)
-
-    students.append(student)
 
     return web.Response(
         content_type='application/json',

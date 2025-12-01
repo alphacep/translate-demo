@@ -13,6 +13,8 @@ class PlaybackTrack(MediaStreamTrack):
         super().__init__()
 
     def select(self, filename):
+        if self.track is not None:
+            self.track.stop()
         self.track = MediaPlayer(filename, format="wav", loop=False).audio
 
     async def recv(self):
@@ -24,6 +26,8 @@ class PlaybackTrack(MediaStreamTrack):
             async with asyncio.timeout(1):
                 frame = await self.track.recv()
         except Exception as e:
+            if self.track is not None:
+                self.track.stop()
             self.track = MediaPlayer("silence.wav", format="wav", loop=True).audio
             frame = await self.track.recv()
 
@@ -32,3 +36,8 @@ class PlaybackTrack(MediaStreamTrack):
         self.time += 0.02
 
         return frame
+
+    def stop(self):
+        print ("Stopping media track")
+        if self.track is not None:
+            self.track.stop()
